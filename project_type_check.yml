@@ -1,0 +1,208 @@
+name: Project Type Check
+
+on:
+  push:
+  merge_group:
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write  # 添加创建issue的权限
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'python' ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+          python -m pip install mypy types-requests types-setuptools
+
+      # Type checking with mypy
+      - name: Run mypy
+        run: |
+          mypy --python-version 3.10 --show-column-numbers --show-error-codes --ignore-missing-imports kirara_ai --output json > mypy_output.json
+        continue-on-error: true
+
+      # 处理mypy结果并创建Issue
+      - name: Process mypy results and create issue
+        if: always()
+        run: |
+          cat > mypy-issue-creator.py << 'EOF'
+          #!/usr/bin/env python3
+          import json
+          import os
+          import datetime
+          
+          # 读取 mypy JSON 输出
+          try:
+              with open("mypy_output.json", "r") as f:
+                  content = f.read()
+                  if content.strip():
+                      mypy_results = [json.loads(line) for line in content.splitlines() if line.strip()]
+                  else:
+                      print("mypy_output.json 文件为空")
+                      mypy_results = []
+          except FileNotFoundError:
+              print("警告：mypy_output.json 文件不存在。创建空结果列表。")
+              mypy_results = []
+          except json.JSONDecodeError as e:
+              print(f"解析 JSON 时出错: {e}")
+              with open("mypy_output.json", "r") as f:
+                  print(f"文件内容: {f.read()[:1000]}")  # 打印文件内容的前1000个字符以便调试
+              mypy_results = []
+          
+          # 按文件和错误类型组织结果
+          results_by_file = {}
+          
+          for result in mypy_results:
+              file_path = result.get("file", "未知文件")
+              if file_path not in results_by_file:
+                  results_by_file[file_path] = []
+              results_by_file[file_path].append(result)
+          
+          # 创建美观的Markdown报告
+          today = datetime.datetime.now().strftime("%Y-%m-%d")
+          run_url = f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}"
+          
+          issue_title = f"Mypy 类型检查报告 ({today})"
+          
+          # 构建Markdown内容
+          markdown = f"# Mypy 类型检查报告\n\n"
+          markdown += f"**生成时间**: {today}\n"
+          markdown += f"**工作流运行**: [查看运行详情]({run_url})\n\n"
+          
+          # 添加摘要统计
+          error_count = len(mypy_results)
+          file_count = len(results_by_file)
+          
+          markdown += f"## 摘要\n\n"
+          markdown += f"- 发现 **{error_count}** 个类型问题\n"
+          markdown += f"- 影响 **{file_count}** 个文件\n\n"
+          
+          # 错误类型统计
+          error_types = {}
+          for result in mypy_results:
+              error_code = result.get("code", "unknown")
+              if error_code not in error_types:
+                  error_types[error_code] = 0
+              error_types[error_code] += 1
+          
+          if error_types:
+              markdown += "### 错误类型统计\n\n"
+              markdown += "| 错误类型 | 数量 |\n"
+              markdown += "|---------|------|\n"
+              for error_type, count in sorted(error_types.items(), key=lambda x: x[1], reverse=True):
+                  markdown += f"| `{error_type}` | {count} |\n"
+              markdown += "\n"
+          
+          # 按文件展示详细问题
+          if results_by_file:
+              markdown += "## 详细问题\n\n"
+              
+              for file_path, errors in sorted(results_by_file.items()):
+                  relative_path = file_path
+                  markdown += f"### 📄 {relative_path}\n\n"
+                  
+                  # 按行号排序
+                  errors.sort(key=lambda x: x.get("line", 0))
+                  
+                  markdown += "| 行:列 | 错误类型 | 消息 |\n"
+                  markdown += "|-------|----------|------|\n"
+                  
+                  for error in errors:
+                      line = error.get("line", "?")
+                      column = error.get("column", "?")
+                      position = f"{line}:{column}"
+                      error_code = f"`{error.get('code', 'unknown')}`"
+                      message = error.get("message", "").replace("|", "\\|")  # 转义表格分隔符
+                      
+                      markdown += f"| {position} | {error_code} | {message} |\n"
+                  
+                  markdown += "\n"
+          else:
+              markdown += "## 🎉 没有发现类型问题!\n\n"
+          
+          # 添加帮助信息
+          markdown += "## 帮助\n\n"
+          markdown += "- [Mypy 错误代码列表文档](https://mypy.readthedocs.io/en/stable/error_code_list.html)\n"
+          markdown += "- [Python 类型提示指南](https://mypy.readthedocs.io/en/stable/cheat_sheet_py3.html)\n"
+          
+          # 将Markdown内容写入文件
+          with open("mypy_report.md", "w") as f:
+              f.write(markdown)
+          
+          print(f"成功处理 {len(mypy_results)} 个 mypy 错误并生成报告")
+          EOF
+          
+          python mypy-issue-creator.py
+
+      # 查找是否已有相同标题的issue
+      - name: Find existing issues
+        uses: actions/github-script@v6
+        id: find-issue
+        with:
+          script: |
+            const title = `Mypy 类型检查报告 (${new Date().toISOString().slice(0, 10)})`;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'type-check'
+            });
+            
+            // 查找相似标题的issue
+            const existingIssue = issues.find(i => i.title.startsWith('Mypy 类型检查报告'));
+            if (existingIssue) {
+              console.log(`Found existing issue: #${existingIssue.number}`);
+              return existingIssue.number;
+            }
+            return null;
+
+      # 更新或创建issue
+      - name: Update or create issue
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const issueBody = fs.readFileSync('mypy_report.md', 'utf8');
+            const title = `Mypy 类型检查报告 (${new Date().toISOString().slice(0, 10)})`;
+            const labels = ['type-check', 'automated-report'];
+            
+            const existingIssueNumber = ${{ steps.find-issue.outputs.result }};
+            
+            if (existingIssueNumber) {
+              // 更新现有issue
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssueNumber,
+                title: title,
+                body: issueBody
+              });
+              console.log(`Updated issue #${existingIssueNumber}`);
+            } else {
+              // 创建新issue
+              const { data } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: issueBody,
+                labels: labels
+              });
+              console.log(`Created issue #${data.number}`);
+            }
